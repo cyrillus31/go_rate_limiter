@@ -1,80 +1,48 @@
 package main
 
 import (
-	"bufio"
-	"fmt"
-	"io"
 	"os"
-	"sync"
 	"time"
+
+	"github.com/cyrillus31/go_rate_limiter/ratelimiter"
+	"github.com/joho/godotenv"
+	tele "gopkg.in/telebot.v4"
 )
 
-var done = make(chan struct{})
-
-type RateLimiter struct {
-	// Function that returns if a rate limite shall be applied to this object
-	Key     func(interface{}) bool
-	channel chan interface{}
-	r       io.Reader
-	w       io.Writer
-	sync.WaitGroup
+type BotRespWriter struct {
+	bot  *tele.Bot
+	user *tele.Chat
 }
 
-func (rl *RateLimiter) writeLoop() {
-	for {
-		select {
-		case <-time.Tick(time.Second * 2):
-			select {
-			case object := <- rl.channel:
-				msg := fmt.Sprintf("Rate limited: '%s'", object.(string))
-				fmt.Fprintln(rl.w, msg)
-			default:
-				continue
-			}
-		case <-done:
-			defer fmt.Println("Finish: write loop exited.")
-			return
-		}
-	}
+func (w *BotRespWriter) SetUser(user *tele.Chat) {
+	w.user = user
 }
 
-func (rl *RateLimiter) Limit(object interface{}) {
-	if ! rl.Key(object) {
-		rl.w.Write(object.([]byte))
-	}
-	rl.Add(1)
-	go func() {
-		defer rl.Done()
-		select {
-		case rl.channel <- object:
-		default:
-			fmt.Printf("Object '%s' was discarded.", object)
-		}
-	}()
-}
-
-func NewRateLimiter(cap int, w io.Writer) *RateLimiter {
-	rl := &RateLimiter{
-		Key: func(i interface{}) bool {return true},
-		channel: make(chan interface{}, cap),
-		w: w,
-	}
-	go rl.writeLoop()
-	return rl
+func (w BotRespWriter) Write(p []byte) (n int, err error) {
+	_, err = w.bot.Send(w.user, string(p))
+	return len(p), err
 }
 
 func main() {
-	rl := NewRateLimiter(5, os.Stdout)
-	scanner := bufio.NewScanner(os.Stdin)
-	defer fmt.Println("Finish: Wait group awaiting done.")
-	defer rl.Wait()
-	for scanner.Scan() {
-		input := scanner.Text()
-		if input == "exit" {
-			close(done)
-			fmt.Println("Finish: Channel closed")
-			return
-		}
-		rl.Limit(input)
+	godotenv.Load()
+
+	settings := tele.Settings{
+		Token:  os.Getenv("TOKEN"),
+		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
 	}
+
+	bot, _ := tele.NewBot(settings)
+
+	botWriter := &BotRespWriter{bot: bot}
+	rl := ratelimiter.NewRateLimiter(5, botWriter)
+
+	bot.Handle(tele.OnText, func(ctx tele.Context) error {
+		user := ctx.Chat()
+		text := ctx.Text()
+		botWriter.SetUser(user)
+		rl.Limit(text)
+		return nil
+	})
+
+	bot.Start()
 }
